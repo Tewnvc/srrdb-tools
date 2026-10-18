@@ -13,10 +13,8 @@
 
 (function () {
     'use strict';
-
-    // true  — сразу перенаправлять на digitalcore.club
-    // false — только показать кнопку на странице srrdb
-    const AUTO_REDIRECT = true;
+    
+    const AUTO_REDIRECT = false;
 
     // Название релиза берём из адреса страницы (оно совпадает с полем RELEASE)
     const parts = location.pathname.split('/').filter(Boolean);
