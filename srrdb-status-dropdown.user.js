@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         SRRDB — выпадающий список «Готово / Пропуск»
 // @namespace    https://srrdb.com/
-// @version      1.1
+// @version      1.2
 // @description  Добавляет справа от каждого релиза в списке выпадающий список (Готово / Пропуск). Выбор запоминается.
 // @match        https://www.srrdb.com/*
 // @match        https://srrdb.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @updateURL    https://raw.githubusercontent.com/Tewnvc/srrdb-tools/main/srrdb-status-dropdown.user.js
+// @downloadURL  https://raw.githubusercontent.com/Tewnvc/srrdb-tools/main/srrdb-status-dropdown.user.js
 // @run-at       document-idle
 // ==/UserScript==
 
