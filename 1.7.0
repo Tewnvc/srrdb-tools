@@ -1,0 +1,1520 @@
+// ==UserScript==
+// @name         Игровые ссылки: GOG / GOGDB / RuTracker / Tapochek / AppNetica + русские даты
+// @namespace    https://tampermonkey.net/
+// @version      1.7.0
+// @description  Объединённый скрипт: ссылки поиска между RuTracker, Tapochek, AppNetica, GOG и GOGDB; русские даты на GOGDB; шаблоны раздач (Steam / SteamDB / GOG).
+// @match        https://rutracker.org/forum/viewtopic.php*
+// @match        https://tapochek.net/viewtopic.php*
+// @match        https://appnetica.com/games/*
+// @match        https://www.gog.com/*
+// @match        https://www.gogdb.org/*
+// @match        https://store.steampowered.com/app/*
+// @match        https://steamdb.info/app/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setClipboard
+// @connect      store.steampowered.com
+// @connect      api.steampowered.com
+// @connect      steamdb.info
+// @connect      api.steamcmd.net
+// @connect      api.gog.com
+// @connect      embed.gog.com
+// @connect      catalog.gog.com
+// @connect      www.gogdb.org
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  const host = location.hostname;
+  const onRutracker = host.endsWith("rutracker.org");
+  const onTapochek = host.endsWith("tapochek.net");
+  const onAppnetica = host.endsWith("appnetica.com");
+  const onGog = host === "www.gog.com";
+  const onGogdb = host.endsWith("gogdb.org");
+  const onSteam = host === "store.steampowered.com" || host === "steamdb.info";
+
+  // ───────────────────────── Общие настройки ─────────────────────────
+
+  const RUTRACKER_FORUMS =
+    "1007,1008,127,128,1310,2118,2203,2204,2205,2206,2225,2226,2228,2410,278,5,50,51,52,53,54,635,646,647,900";
+
+  const COLOR_SEARCH = "#2e8b57"; // RuTracker / Tapochek / AppNetica
+  const COLOR_GOGDB = "#5a2d82";  // GOGDB
+  const COLOR_STEAM = "#1b2838";  // Steam
+
+  function styleButton(a, color, extra) {
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    Object.assign(
+      a.style,
+      {
+        display: "inline-block",
+        margin: "0 8px 0 0",
+        padding: "6px 12px",
+        background: color,
+        color: "#fff",
+        borderRadius: "4px",
+        font: "600 13px/1.4 sans-serif",
+        textDecoration: "none",
+      },
+      extra || {}
+    );
+  }
+
+  function gogdbUrl(name) {
+    return "https://www.gogdb.org/products?" + new URLSearchParams({ search: name }).toString();
+  }
+
+  // Формат "Русское название / English name": берём вариант с латиницей
+  function pickLatin(name) {
+    const parts = name.split(/\s+\/\s+/).map((s) => s.trim()).filter(Boolean);
+    const latin = parts.filter((s) => /[A-Za-z]/.test(s));
+    return (latin.length ? latin[latin.length - 1] : parts[0] || name).trim();
+  }
+
+  // ───────────────────────── GOGDB: русские даты ─────────────────────────
+
+  function initRussianDates() {
+    const MONTHS = [
+      "января", "февраля", "марта", "апреля", "мая", "июня",
+      "июля", "августа", "сентября", "октября", "ноября", "декабря",
+    ];
+
+    // true  -> "2026-10-12 (от 12 октября 2026)"
+    // false -> заменить дату на "(от 12 октября 2026)"
+    const KEEP_ORIGINAL = true;
+
+    const DATE_RE = /(\d{4})-(\d{2})-(\d{2})(?!\d)(?! \(от )/g;
+    const SKIP = new Set(["SCRIPT", "STYLE", "TEXTAREA", "INPUT", "NOSCRIPT"]);
+
+    function convert(text) {
+      return text.replace(DATE_RE, (match, y, m, d) => {
+        const month = MONTHS[Number(m) - 1];
+        if (!month || Number(d) < 1 || Number(d) > 31) return match;
+        const pretty = `(от ${Number(d)} ${month} ${y})`;
+        return KEEP_ORIGINAL ? `${match} ${pretty}` : pretty;
+      });
+    }
+
+    function process(root) {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+          const p = node.parentElement;
+          if (!p || SKIP.has(p.tagName)) return NodeFilter.FILTER_REJECT;
+          DATE_RE.lastIndex = 0;
+          return DATE_RE.test(node.nodeValue)
+            ? NodeFilter.FILTER_ACCEPT
+            : NodeFilter.FILTER_REJECT;
+        },
+      });
+      const nodes = [];
+      while (walker.nextNode()) nodes.push(walker.currentNode);
+      nodes.forEach((n) => { n.nodeValue = convert(n.nodeValue); });
+    }
+
+    let timer = null;
+    function schedule() {
+      clearTimeout(timer);
+      timer = setTimeout(() => process(document.body), 150);
+    }
+
+    process(document.body);
+    new MutationObserver(schedule).observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+  }
+
+  // ───────────────────────── GOG → GOGDB ─────────────────────────
+
+  function initGog() {
+    const LINK_ID = "gogdb-link-ext";
+
+    function getTitleElement() {
+      return document.querySelector("h1.productcard-basics__title") || document.querySelector("h1");
+    }
+
+    function isGamePage() {
+      return /\/game\//.test(location.pathname);
+    }
+
+    const pageSlug = () => (location.pathname.match(/\/game\/([^/?#]+)/) || [])[1] || "";
+
+    function removeLink() {
+      const el = document.getElementById(LINK_ID);
+      if (el) el.remove();
+    }
+
+    // ---- определение ID продукта GOG для прямой ссылки на GOGDB ----
+    function gmJSON(url) {
+      return new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          method: "GET",
+          url,
+          onload: (r) => {
+            if (r.status !== 200) return reject(new Error("HTTP " + r.status));
+            try { resolve(JSON.parse(r.responseText)); } catch (e) { reject(e); }
+          },
+          onerror: () => reject(new Error("Ошибка сети")),
+        });
+      });
+    }
+
+    function idCandidates() {
+      const ids = [];
+      document.querySelectorAll("[card-product]").forEach((el) => {
+        const v = el.getAttribute("card-product");
+        if (/^\d+$/.test(v || "")) ids.push(v);
+      });
+      const html = document.documentElement.innerHTML;
+      const re = /card-product="(\d+)"|"cardProductId"\s*:\s*"?(\d+)|data-product-id="(\d+)"/g;
+      let m;
+      while ((m = re.exec(html))) ids.push(m[1] || m[2] || m[3]);
+      return [...new Set(ids)];
+    }
+
+    async function resolveGogId(slug) {
+      // 1) кандидаты со страницы; подтверждаем, что slug продукта совпадает со slug страницы
+      for (const id of idCandidates().slice(0, 6)) {
+        try {
+          const j = await gmJSON("https://api.gog.com/products/" + id);
+          if (j && j.slug === slug) return String(id);
+        } catch (e) { /* пробуем следующий */ }
+      }
+      // 2) запасной вариант: поиск по slug
+      try {
+        const j = await gmJSON(
+          "https://embed.gog.com/games/ajax/filtered?mediaType=game&search=" +
+            encodeURIComponent(slug.replace(/_/g, " "))
+        );
+        const hit = ((j && j.products) || []).find((p) => p.slug === slug);
+        if (hit) return String(hit.id);
+      } catch (e) { /* ignore */ }
+      return "";
+    }
+
+    const idState = {}; // slug -> { id, pending, tries }
+
+    function gogdbHref(title, slug) {
+      const st = idState[slug];
+      if (st && st.id) return "https://www.gogdb.org/product/" + st.id + "#builds";
+      return "https://www.gogdb.org/products?search=" + encodeURIComponent(title);
+    }
+
+    function ensureId(slug) {
+      if (!slug) return;
+      const st = idState[slug] || (idState[slug] = { id: "", pending: false, tries: 0 });
+      if (st.id || st.pending || st.tries >= 3) return;
+      st.pending = true;
+      st.tries++;
+      resolveGogId(slug)
+        .then((id) => { st.id = id; })
+        .catch(() => {})
+        .finally(() => { st.pending = false; update(); });
+    }
+
+    function update() {
+      if (!isGamePage()) {
+        removeLink();
+        return;
+      }
+
+      const h1 = getTitleElement();
+      const title = h1 && h1.textContent.trim();
+      if (!title) return;
+
+      const slug = pageSlug();
+      ensureId(slug);
+      const url = gogdbHref(title, slug);
+
+      let link = document.getElementById(LINK_ID);
+      if (!link) {
+        link = document.createElement("a");
+        link.id = LINK_ID;
+        link.textContent = "Открыть в GOGDB ↗";
+        styleButton(link, COLOR_GOGDB, { margin: "8px 0", cursor: "pointer" });
+      }
+
+      if (link.href !== url) link.href = url;
+      if (link.previousElementSibling !== h1) h1.insertAdjacentElement("afterend", link);
+    }
+
+    // GOG — SPA: следим за изменениями DOM и сменой страницы
+    let timer;
+    new MutationObserver(() => {
+      clearTimeout(timer);
+      timer = setTimeout(update, 200);
+    }).observe(document.body, { childList: true, subtree: true });
+
+    update();
+  }
+
+  // ───────────────── GOGDB: из поиска сразу на страницу игры (Type = Game) ─────────────────
+
+  function initGogdbOpenGame() {
+    if (!/^\/products\/?$/.test(location.pathname)) return;
+    if (!new URLSearchParams(location.search).get("search")) return;
+
+    function findGameLink() {
+      for (const tr of document.querySelectorAll("table tr")) {
+        const isGame = [...tr.children].some((c) => /^\s*game\s*$/i.test(c.textContent));
+        if (!isGame) continue;
+        const a = tr.querySelector('a[href*="/product/"]');
+        if (a) return a.href;
+      }
+      return "";
+    }
+
+    let tries = 0;
+    const timer = setInterval(() => {
+      tries++;
+      const href = findGameLink();
+      if (href) {
+        clearInterval(timer);
+        location.replace(href.split("#")[0] + "#builds");
+      } else if (tries > 40) {
+        clearInterval(timer); // Game-строки нет — остаёмся на поиске
+      }
+    }, 250);
+  }
+
+  // ───────────────── RuTracker / Tapochek / AppNetica ─────────────────
+
+  function initTopicPages() {
+    const titleEl =
+      document.querySelector("#topic-title") ||
+      document.querySelector("h1.maintitle a") ||
+      document.querySelector("a.maintitle") ||
+      document.querySelector("h1.maintitle") ||
+      document.querySelector(".maintitle") ||
+      document.querySelector("h1");
+    if (!titleEl) return;
+
+    const full = titleEl.textContent.replace(/\s+/g, " ").trim();
+    let name;
+
+    if (onAppnetica) {
+      // Основной источник — <title>: "Название на Appnetica" (без бейджа "GOG")
+      const fromTitle = document.title.replace(/\s+на\s+Appnetica\s*$/i, "").trim();
+      if (fromTitle && fromTitle !== document.title.trim()) {
+        name = fromTitle;
+      } else {
+        name = titleEl.textContent;
+      }
+      name = name.replace(/\s+/g, " ").replace(/\s+GOG$/i, "").trim();
+    } else {
+      name = full;
+      // Убираем ведущие "(жанр)" и "[теги]"
+      name = name.replace(/^(\s*[\(\[][^\)\]]*[\)\]])+\s*/, "");
+      // Обрезаем всё с первой "[" или "("
+      name = name.split("[")[0];
+      name = name.replace(/\s*\(.*$/, "");
+      name = pickLatin(name);
+    }
+
+    if (!name) return;
+
+    // Для AppNetica убираем - : ' и типографские варианты (’ ‘ – —)
+    const simpleName = name.replace(/[-:'’‘`–—]/g, "").replace(/\s+/g, " ").trim();
+
+    const rutrackerLink = {
+      label: "Искать на RuTracker ↗ (" + name + ")",
+      url:
+        "https://rutracker.org/forum/tracker.php?f=" + RUTRACKER_FORUMS +
+        "&nm=" + encodeURIComponent(name),
+      color: COLOR_SEARCH,
+    };
+    const tapochekLink = {
+      label: "Искать на Tapochek ↗ (" + name + ")",
+      url:
+        "https://tapochek.net/tracker.php?" +
+        new URLSearchParams({ nm: name }).toString() +
+        "#results",
+      color: COLOR_SEARCH,
+    };
+    const appneticaLink = {
+      label: "Искать на AppNetica ↗ (" + simpleName + ")",
+      url:
+        "https://appnetica.com/search?" +
+        new URLSearchParams({ term: simpleName }).toString(),
+      color: COLOR_SEARCH,
+    };
+    const gogdbLink = {
+      label: "Искать на GOGDB ↗ (" + name + ")",
+      url: gogdbUrl(name),
+      color: COLOR_GOGDB,
+    };
+    const steamLink = {
+      label: "Искать в Steam ↗ (" + name + ")",
+      url:
+        "https://store.steampowered.com/search/?" +
+        new URLSearchParams({ term: name }).toString(),
+      color: COLOR_STEAM,
+    };
+
+    const isGog = /\bGOG\b/i.test(full); // тег в любых скобках или без них
+    const isPortableOrScene = /\b(portable|scene)\b/i.test(full);
+    console.log('[game-links] заголовок:', full, '| GOG:', isGog, '| Portable/Scene:', isPortableOrScene);
+
+    let links;
+    if (onAppnetica) {
+      links = [gogdbLink];
+    } else {
+      if (onRutracker) {
+        // RuTracker: GOG → Tapochek + AppNetica; Portable/Scene → Steam; иначе ничего
+        if (isGog) links = [tapochekLink, appneticaLink];
+        else if (isPortableOrScene) links = [steamLink];
+        else links = [];
+      } else {
+        links = [rutrackerLink, appneticaLink];
+      }
+
+      // Если в заголовке есть тег [GOG] — добавляем кнопку GOGDB
+      // (название берётся после [DL], если оно есть)
+      if (isGog) {
+        let g;
+        const m = full.match(/\[DL\]\s*(.+)/i);
+        if (m) {
+          g = m[1];
+        } else {
+          g = full.replace(/^(\s*[\(\[][^\)\]]*[\)\]])+\s*/, "");
+        }
+        g = g.split("[")[0];
+        g = g.replace(/\s*\(.*$/, "");
+        g = pickLatin(g) || name;
+        if (g) {
+          links.push({
+            label: "Открыть в GOGDB ↗ (" + g + ")",
+            url: gogdbUrl(g),
+            color: COLOR_GOGDB,
+          });
+        }
+      }
+    }
+
+    if (!links.length) return;
+
+    const box = document.createElement("div");
+    Object.assign(box.style, { margin: "6px 0" });
+
+    for (const { label, url, color } of links) {
+      const a = document.createElement("a");
+      a.href = url;
+      a.textContent = label;
+      styleButton(a, color);
+      box.appendChild(a);
+    }
+
+    const h1 = titleEl.closest("h1") || titleEl;
+    h1.insertAdjacentElement("afterend", box);
+  }
+
+  // ───────────────────── Steam / SteamDB / GOG → шаблон раздачи ─────────────────────
+
+  function initSteamTemplate() {
+  function getText(url) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET', url,
+        onload: (r) => (r.status === 200 ? resolve(r.responseText) : reject(new Error('HTTP ' + r.status))),
+        onerror: () => reject(new Error('Ошибка сети')),
+      });
+    });
+  }
+
+  function getJSON(url, headers) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET', url, headers: headers || {},
+        onload: (r) => {
+          if (r.status !== 200) return reject(new Error('HTTP ' + r.status));
+          try { resolve(JSON.parse(r.responseText)); } catch (e) { reject(e); }
+        },
+        onerror: () => reject(new Error('Ошибка сети')),
+      });
+    });
+  }
+
+const MONTHS = { янв:'января', фев:'февраля', мар:'марта', апр:'апреля', мая:'мая', июн:'июня',
+                 июл:'июля', авг:'августа', сен:'сентября', окт:'октября', ноя:'ноября', дек:'декабря' };
+
+// ---------- ШАБЛОН ----------
+// Шаблон Scene (со Steam)
+function buildSceneTemplate(d) {
+return `[DL] ${d.ea ? '[В разработке] ' : ''}${d.name} [P] [${d.langTag}] (${d.year}, ${d.genreEn}) (________ + 1 DLC) [Scene]
+
+[box=center,#e1cb8d,#e5e2d8][box=center,transparent,#e5e2d8]
+[font=serif1][align=center][img=15]${d.logo}[/img][/align]
+[hr]
+[align=center][size=24]${d.name}[/size][/align]
+[hr]
+[img=right]${d.poster}[/img]
+[size=17][b][color=indigo]Дата выхода[/color][/b]: ${d.date}
+[b][color=indigo]Жанр[/color][/b]: ${d.genres}
+[b][color=indigo]Разработчик[/color][/b]: ${d.developers}
+[b][color=indigo]Издатель[/color][/b]: ${d.publishers}
+[b][color=indigo]Источник[/color][/b]: [url=https://store.steampowered.com/app/${d.appid}]Digital[/url]
+[b][color=indigo]Версия[/color][/b]: ___________ [url=https://steamdb.info/app/${d.appid}/patchnotes/]Build ___________[/url] от ___________
+[b][color=indigo]Тип издания[/color][/b]: Неофициальный
+[b][color=indigo]Релиз[/color][/b]: Scene
+[b][color=indigo]Язык интерфейса[/color][/b]: ${d.ui}
+[b][color=indigo]Язык озвучки[/color][/b]: ${d.voice}
+[b][color=indigo]Таблэтка[/color][/b]: Присутствует (TENOKE)
+[b][color=indigo]Реклама[/color][/b]: Отсутствует
+[hr]
+[size=16][b]Системные требования[/b]:
+[i][u]Минимальные[/u][/i]
+[b][color=indigo]ОС[/color][/b]: ${d.req.os}
+[b][color=indigo]Процессор[/color][/b]: ${d.req.cpu}
+[b][color=indigo]Оперативная память[/color][/b]: ${d.req.ram}
+[b][color=indigo]Видеокарта[/color][/b]: ${d.req.gpu}
+[b][color=indigo]DirectX[/color][/b]: ${d.req.dx}
+[b][color=indigo]Место на диске[/color][/b]: ${d.req.disk}
+[/size]
+[hr]
+[size=16][b]Описание[/b]: ${d.description}
+[img]https://i1.imageban.ru/out/2020/06/26/5377779c424990e412803ed50ba8781a.png[/img]
+
+[spoiler="Порядок установки"]
+Снять проверку с iso образа
+[URL=https://imageban.ru/show/2026/09/22/ac547813eee94919f15160c7cf487c9e/png][IMG]https://i2.imageban.ru/thumbs/2026.09.22/ac547813eee94919f15160c7cf487c9e.png[/IMG][/URL] [URL=https://imageban.ru/show/2026/01/22/1f1eb1a47bf094deb5881ead34cb7ed9/png][IMG]https://i4.imageban.ru/thumbs/2026.01.22/1f1eb1a47bf094deb5881ead34cb7ed9.png[/IMG][/URL]
+1. Смонтировать образ (можно с помощью WinRAR)
+2. Запустить установщик
+3. Следовать инструкциям установщика
+4. Скопируйте кряк для установки (либо вручную, либо в установщике)
+[URL=https://imageban.ru/show/2025/07/28/d6ae7c4b1987d29e7b0c41dc3abf4aa4/png][IMG]https://i7.imageban.ru/thumbs/2025.07.28/d6ae7c4b1987d29e7b0c41dc3abf4aa4.png[/IMG][/URL]
+[URL=https://imageban.ru/show/2025/07/31/500d96495d030e2c890831581cc7512b/png][IMG]https://i4.imageban.ru/thumbs/2025.07.31/500d96495d030e2c890831581cc7512b.png[/IMG][/URL]
+Установить обновления
+5. Играть
+
+Во избежание недоразумений отключите ваш антивирус на время всех вышеописанных манипуляций. Также рекомендуется всю папку с установленной игрой добавить в список исключения проверки вашим антивирусом.
+[/spoiler]
+
+[spoiler="NFO"][nfo]
+__________
+[/nfo][/spoiler]
+[spoiler="Скриншоты"][align=center]
+${d.shots}
+[/align][/spoiler]
+[url=tracker.php?nm=${d.search}][b]Предыдущие и альтернативные раздачи[/b][/url]`;
+}
+
+function buildTemplate(d, kind = 'portable') {
+const gog = kind === 'gog';
+const bonus = gog && d.bonus ? `[spoiler="Бонусы"]\n${d.bonus}\n[/spoiler]\n\n` : '';
+const dlcs = gog && d.dlc ? `[spoiler="DLC"]\n${d.dlc}\n[/spoiler]\n\n` : '';
+const install = gog
+  ? `[spoiler="Порядок установки"]
+1. Запустить [color=green][b].exe[/b][/color]
+2. Следовать инструкции установщика
+3. Играть
+[/spoiler]`
+  : `[spoiler="Порядок установки"]
+1. Скачать
+2. Запустить [color=green][b].exe[/b][/color]
+3. Играть
+
+Во избежание недоразумений отключите ваш антивирус на время всех вышеописанных манипуляций. Также рекомендуется всю папку с установленной игрой добавить в список исключения проверки вашим антивирусом.
+[/spoiler]`;
+return `[DL] ${d.ea ? '[В разработке] ' : ''}${d.name} ${gog ? '[L]' : '[P]'} [${d.langTag}] (${d.year}, ${d.genreEn}) (${gog ? (d.version || '________') + (d.dlcCount === undefined ? ' + 1 DLC' : d.dlcCount > 0 ? ` + ${d.dlcCount} DLC` : '') : '________'}) [${gog ? 'GOG' : 'Portable'}]
+
+[box=center,#e1cb8d,#e5e2d8][box=center,transparent,#e5e2d8]
+[font=serif1][align=center][img=15]${d.logo}[/img][/align]
+[hr]
+[align=center][size=24]${d.name}[/size][/align]
+[hr]
+[img=right]${d.poster}[/img]
+[size=17][b][color=indigo]Дата выхода[/color][/b]: ${d.date}
+[b][color=indigo]Жанр[/color][/b]: ${d.genres}
+[b][color=indigo]Разработчик[/color][/b]: ${d.developers}
+[b][color=indigo]Издатель[/color][/b]: ${d.publishers}
+[b][color=indigo]Источник[/color][/b]: [url=${gog ? (d.gogUrl || 'https://www.gog.com/ru/game/__________________') : 'https://store.steampowered.com/app/' + d.appid}]Digital[/url]
+[b][color=indigo]Версия[/color][/b]: ${gog ? `[url=https://www.gogdb.org/product/${d.gogId || '______________'}]${d.version || '__Версия_игры__'}[/url] от ${d.versionDate || '___________'}` : `___________ [url=https://steamdb.info/app/${d.appid}/patchnotes/]Build ___________[/url] от ___________`}
+[b][color=indigo]Тип издания[/color][/b]: ${gog ? 'Лицензия' : 'Неофициальный'}
+[b][color=indigo]Релиз[/color][/b]: ${gog ? 'GOG' : 'Portable'}
+[b][color=indigo]Язык интерфейса[/color][/b]: ${d.ui}
+[b][color=indigo]Язык озвучки[/color][/b]: ${d.voice}
+[b][color=indigo]Таблэтка[/color][/b]: ${gog ? 'Не требуется (DRM-FREE)' : 'Вшита (__________)'}
+[b][color=indigo]Реклама[/color][/b]: ${gog ? 'Присутствует, реклама магазина GOG' : 'Отсутствует'}
+[hr]
+[size=16][b]Системные требования[/b]:
+[i][u]Минимальные[/u][/i]
+[b][color=indigo]ОС[/color][/b]: ${d.req.os}
+[b][color=indigo]Процессор[/color][/b]: ${d.req.cpu}
+[b][color=indigo]Оперативная память[/color][/b]: ${d.req.ram}
+[b][color=indigo]Видеокарта[/color][/b]: ${d.req.gpu}
+[b][color=indigo]DirectX[/color][/b]: ${d.req.dx}
+[b][color=indigo]Место на диске[/color][/b]: ${d.req.disk}
+[/size]
+[hr]
+[size=16][b]Описание[/b]: ${d.description}
+[img]https://i1.imageban.ru/out/2020/06/26/5377779c424990e412803ed50ba8781a.png[/img]
+
+${dlcs}${bonus}${install}
+
+[spoiler="Скриншоты"][align=center]
+${d.shots}
+[/align][/spoiler]
+[url=tracker.php?nm=${d.search}][b]Предыдущие и альтернативные раздачи[/b][/url]${gog ? '\nСпасибо [b]R.G.GOGFAN[/b]' : ''}`;
+}
+
+// ---------- ПАРСИНГ ----------
+const textOf = (html) =>
+  new DOMParser().parseFromString(html || '', 'text/html').body.textContent.replace(/\s+/g, ' ').trim();
+const lcfirst = (s) => s.charAt(0).toLowerCase() + s.slice(1);
+
+function parseDate(s) {
+  if (!s) return '—';
+  const m = s.match(/(\d{1,2})\s+([а-яё]+)\.?\s+(\d{4})/i);
+  if (!m) return s;
+  return `${m[1]} ${MONTHS[m[2].slice(0, 3).toLowerCase()] || m[2]} ${m[3]}`;
+}
+
+function normLang(name) {
+  const n = name.replace(/\s+/g, ' ').trim()
+    .replace(/испанский\s*[—–-]\s*испания/i, 'испанский')
+    .replace(/испанский\s*[—–-]\s*латинская америка/i, 'испанский Лат. Ам.')
+    .replace(/португальский\s*[—–-]\s*бразилия/i, 'бр. португальский')
+    .replace(/португальский\s*[—–-]\s*португалия/i, 'португальский')
+    .replace(/китайский упрощ[её]нный/i, 'китайский (упр.)')
+    .replace(/китайский традиционный/i, 'китайский (трад.)');
+  return n.charAt(0).toLowerCase() + n.slice(1);
+}
+
+// список языков через запятую: с заглавной буквы только первый
+const joinLangs = (arr) => {
+  const t = arr.join(', ');
+  return t.charAt(0).toUpperCase() + t.slice(1);
+};
+
+// порядок языков: русский первым; если русского нет — первым английский
+function orderLangs(arr) {
+  const u = [...new Set(arr)];
+  const ru = u.filter((x) => /^(русский|russian)/i.test(x));
+  if (ru.length) return [...ru, ...u.filter((x) => !ru.includes(x))];
+  const en = u.filter((x) => /^(английский|english)/i.test(x));
+  return [...en, ...u.filter((x) => !en.includes(x))];
+}
+
+function parseLangs(html) {
+  const [list] = (html || '').split(/<br\s*\/?>/i);
+  const all = [], audio = [];
+  list.split(',').forEach((s) => {
+    const isAudio = /<strong>\s*\*\s*<\/strong>/i.test(s);
+    const name = s.replace(/<[^>]+>/g, '').replace(/\*/g, '').trim();
+    if (name) { const n = normLang(name); all.push(n); if (isAudio) audio.push(n); }
+  });
+  const ruFirst = orderLangs;
+  return { all: ruFirst(all), audio: ruFirst(audio) };
+}
+
+function parseReq(html) {
+  const res = { os: '—', cpu: '—', ram: '—', gpu: '—', dx: '—', disk: '—' };
+  const doc = new DOMParser().parseFromString(html || '', 'text/html');
+  const map = [
+    ['os', /^(ос|os|операционная система|operating system)(\s|$)/i], ['cpu', /^(процессор|processor)/i],
+    ['ram', /^(оперативная память|memory)/i], ['gpu', /^(видеокарта|graphics)/i],
+    ['dx', /^directx/i], ['disk', /^(место на диске|storage)/i],
+  ];
+  doc.querySelectorAll('li').forEach((li) => {
+    const label = li.querySelector('strong');
+    if (!label) return;
+    const name = label.textContent.replace(/[:*]/g, '').replace(/\s+/g, ' ').trim();
+    const value = li.textContent.replace(label.textContent, '').replace(/\s+/g, ' ').trim();
+    for (const [key, re] of map) if (re.test(name) && value) res[key] = key === 'dx' ? lcfirst(value) : value;
+  });
+  return res;
+}
+
+// Проверка, что картинка реально грузится в браузере
+function imageLoads(url, ms = 7000) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const t = setTimeout(() => resolve(false), ms);
+    img.onload = () => { clearTimeout(t); resolve(true); };
+    img.onerror = () => { clearTimeout(t); resolve(false); };
+    img.src = url;
+  });
+}
+
+async function firstWorking(candidates) {
+  const list = [...new Set(candidates.filter(Boolean))];
+  for (const u of list) if (await imageLoads(u)) return { url: u, ok: true };
+  return { url: list[0] || '', ok: false };
+}
+
+// Логотип (logo.png 640x360) и постер (library_capsule.jpg 300x450) — те же файлы, что показывает SteamDB
+async function fetchAssets(appid) {
+  const CDN = 'https://shared.fastly.steamstatic.com/store_item_assets/';
+  const log = (...x) => console.log('[steam-template]', ...x);
+  const logoC = [], posterC = [];
+
+  // 1) SteamDB: со страницы, если она открыта, либо запросом (нужно, чтобы Cloudflare вас уже пропустил)
+  const scrapeHtml = (html) => {
+    const re = /https?:\/\/[^"'\s<>)]+\/(logo\.png|library_capsule\.jpg)(?:\?[^"'\s<>)]*)?/gi;
+    let m;
+    while ((m = re.exec(html))) {
+      const u = m[0].split('?')[0];
+      if (!u.includes(`/${appid}/`)) continue;
+      (/logo\.png$/i.test(u) ? logoC : posterC).push(u);
+    }
+  };
+  if (location.hostname === 'steamdb.info') scrapeHtml(document.documentElement.innerHTML);
+  if (!logoC.length) {
+    try { scrapeHtml(await getText(`https://steamdb.info/app/${appid}/info/`)); }
+    catch (e) { log('SteamDB недоступен:', e.message); }
+  }
+  log('из SteamDB:', { logo: [...logoC], poster: [...posterC] });
+
+  // 2) данные appinfo (PICS) через steamcmd.net — там лежат пути library_logo / library_capsule
+  if (!logoC.length) {
+    try {
+      const j = await getJSON(`https://api.steamcmd.net/v1/info/${appid}`);
+      const root = j && j.data && j.data[appid] ? j.data[appid].common : null;
+      const walk = (o, path) => {
+        if (typeof o === 'string') {
+          if (/\.(png|jpg)$/i.test(o) && !/2x/i.test(path)) {
+            const u = /^https?:/.test(o) ? o : `${CDN}steam/apps/${appid}/${o}`;
+            if (/library_logo/i.test(path)) logoC.push(u);
+            else if (/library_capsule/i.test(path)) posterC.push(u);
+          }
+        } else if (o && typeof o === 'object') {
+          for (const [k, v] of Object.entries(o)) walk(v, `${path}.${k}`);
+        }
+      };
+      if (root) walk(root, '');
+      log('из steamcmd.net:', { logo: [...logoC], poster: [...posterC] });
+    } catch (e) { log('steamcmd.net недоступен:', e.message); }
+  }
+
+  // 3) API магазина Steam
+  try {
+    const input = encodeURIComponent(JSON.stringify({
+      ids: [{ appid: Number(appid) }],
+      context: { language: 'russian', country_code: 'US' },
+      data_request: { include_assets: true, include_assets_without_overrides: true },
+    }));
+    const j = await getJSON(`https://api.steampowered.com/IStoreBrowseService/GetItems/v1?input_json=${input}`);
+    const item = j.response.store_items[0];
+    const as = item.assets || {};
+    log('assets API:', as, item.assets_without_overrides);
+    const fmt = as.asset_url_format || `steam/apps/${appid}/\${FILENAME}`;
+    const url = (file) => CDN + fmt.replace('${FILENAME}', file).split('?')[0];
+    if (as.library_capsule) posterC.push(url(as.library_capsule));
+    for (const src of [as, item.assets_without_overrides || {}]) {
+      for (const v of Object.values(src)) {
+        if (typeof v === 'string' && /logo[^/]*\.(png|jpg)$/i.test(v)) logoC.push(url(v));
+      }
+    }
+    if (posterC.length) logoC.push(posterC[posterC.length - 1].replace(/[^/]+$/, 'logo.png'));
+  } catch (e) { log('GetItems не сработал:', e.message); }
+
+  // 4) запасные адреса
+  logoC.push(`${CDN}steam/apps/${appid}/logo.png`,
+             `https://cdn.akamai.steamstatic.com/steam/apps/${appid}/logo.png`,
+             `https://cdn.cloudflare.steamstatic.com/steam/apps/${appid}/logo.png`);
+  posterC.push(`${CDN}steam/apps/${appid}/library_capsule.jpg`,
+               `${CDN}steam/apps/${appid}/library_600x900.jpg`,
+               `https://cdn.akamai.steamstatic.com/steam/apps/${appid}/library_600x900.jpg`);
+
+  log('кандидаты логотипа:', [...new Set(logoC)]);
+  log('кандидаты постера:', [...new Set(posterC)]);
+  const [logo, poster] = await Promise.all([firstWorking(logoC), firstWorking(posterC)]);
+  log('выбрано:', { logo, poster });
+  return {
+    logo: logo.ok ? logo.url : '___________',
+    poster: poster.ok ? poster.url : '___________',
+    logoOk: logo.ok, posterOk: poster.ok,
+  };
+}
+
+// только китайский (упрощённый / традиционный) в списке языков
+function chineseOnly(list) {
+  return list.length > 0 && list.every((x) => /chinese|китайск|中文/i.test(x));
+}
+
+// Тег языков для заголовка: RUS + ENG + N (N — остальные языки)
+function langTag(list, withJpn) {
+  if (withJpn && chineseOnly(list)) return 'ZHO'; // озвучка только на китайском
+  const low = list.map((x) => x.toLowerCase());
+  const has = (...names) => low.some((x) => names.includes(x));
+  const named = ['russian', 'русский', 'english', 'английский'];
+  const parts = [];
+  if (has('russian', 'русский')) parts.push('RUS');
+  if (has('english', 'английский')) parts.push('ENG');
+  if (withJpn) {
+    named.push('japanese', 'японский');
+    if (has('japanese', 'японский')) parts.push('JPN');
+  }
+  const other = low.filter((x) => !named.includes(x)).length;
+  if (other > 0) parts.push(String(other));
+  return parts.join(' + ');
+}
+
+// Скриншоты: все. До 8 шт. — не более 4 в ряд, 9–10 шт. — по 5 в ряд, больше — до 7 в ряд.
+// Строки максимально ровные, меньшие — сверху.
+function buildShots(urls) {
+  if (!urls.length) return '___________';
+  const tags = urls.map((u) => `[url=${u}][img=10]${u}[/img][/url]`);
+  const n = tags.length;
+  const perRow = n <= 8 ? 4 : n <= 10 ? 5 : 7;
+  const rows = Math.ceil(n / perRow);
+  const base = Math.floor(n / rows);
+  const extra = n % rows; // последние `extra` строк получают на один скриншот больше
+  const lines = [];
+  let i = 0;
+  for (let r = 0; r < rows; r++) {
+    const size = base + (r >= rows - extra ? 1 : 0);
+    lines.push(tags.slice(i, i + size).join(' '));
+    i += size;
+  }
+  return lines.join('\n');
+}
+
+async function fetchApp(appid) {
+  const [json, jsonEn, assets] = await Promise.all([
+    getJSON(`https://store.steampowered.com/api/appdetails?appids=${appid}&l=russian&cc=ru`),
+    getJSON(`https://store.steampowered.com/api/appdetails?appids=${appid}&l=english&cc=us`).catch(() => null),
+    fetchAssets(appid),
+  ]);
+  const entry = json[appid];
+  if (!entry || !entry.success) throw new Error('Игра не найдена (возможно, региональное ограничение)');
+  const a = entry.data;
+  const aEn = jsonEn && jsonEn[appid] && jsonEn[appid].success ? jsonEn[appid].data : null;
+
+  const langs = parseLangs(a.supported_languages);
+  const langsEn = aEn ? parseLangs(aEn.supported_languages) : langs; // английский список надёжнее для подсчёта
+  const dateRaw = (a.release_date && a.release_date.date) || '';
+  const dateRawEn = (aEn && aEn.release_date && aEn.release_date.date) || '';
+  const year = (dateRaw.match(/\d{4}/) || dateRawEn.match(/\d{4}/) || [''])[0];
+  const noEA = (arr) => (arr || []).filter((g) => String(g.id) !== '70'); // «Ранний доступ» — не жанр
+  const genresEn = noEA((aEn || a).genres).map((g) => g.description).join(', ');
+
+  return {
+    appid,
+    name: a.name,
+    shots: buildShots((a.screenshots || []).map((x) => x.path_full.split('?')[0])),
+    ea: (a.genres || []).some((g) => String(g.id) === '70'),
+    logo: assets.logo,
+    poster: assets.poster,
+    assetsOk: assets.logoOk && assets.posterOk,
+    assetsMsg: [!assets.logoOk && 'логотип', !assets.posterOk && 'постер'].filter(Boolean).join(' и '),
+    langTag: (langTag(langsEn.all) || 'NO') + (langTag(langsEn.audio, true) ? ` / ${chineseOnly(langsEn.audio) ? 'ZHO' : langTag(langsEn.audio)}` : ''),
+    search: encodeURIComponent(a.name.replace(/[™®©]/g, '').replace(/\s+/g, ' ').trim()),
+    year: year || '____',
+    genreEn: genresEn || '_____',
+    date: parseDate(dateRaw),
+    genres: noEA(a.genres).map((g) => g.description).join(', ') || '—',
+    developers: (a.developers || []).join(', ') || '—',
+    publishers: (a.publishers || []).join(', ') || '—',
+    ui: joinLangs(langs.all) || '—',
+    voice: joinLangs(langs.audio) || 'Отсутствует',
+    req: parseReq(a.pc_requirements && a.pc_requirements.minimum),
+    description: textOf(a.short_description) || '—',
+  };
+}
+
+  // =====================================================================
+  //                         GOG.com (парсер сайта)
+  // =====================================================================
+  const GOG_MONTHS = ['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];
+  const GOG_LANGS = {
+    en:'английский', ru:'русский', de:'немецкий', fr:'французский', es:'испанский',
+    'es-es':'испанский', 'es-mx':'испанский Лат. Ам.', 'es-419':'испанский Лат. Ам.', 'es-la':'испанский Лат. Ам.',
+    pt:'португальский', 'pt-br':'бр. португальский', 'pt-pt':'португальский',
+    it:'итальянский', pl:'польский', cs:'чешский', hu:'венгерский', tr:'турецкий', ja:'японский', ko:'корейский',
+    'zh-hans':'китайский (упр.)', 'zh-cn':'китайский (упр.)', 'zh-hant':'китайский (трад.)', 'zh-tw':'китайский (трад.)', zh:'китайский',
+    uk:'украинский', ar:'арабский', sv:'шведский', nl:'нидерландский', da:'датский', fi:'финский', no:'норвежский', nb:'норвежский',
+    ro:'румынский', bg:'болгарский', el:'греческий', he:'иврит', th:'тайский', vi:'вьетнамский', id:'индонезийский',
+    sk:'словацкий', sl:'словенский', sr:'сербский', hr:'хорватский', lt:'литовский', lv:'латышский', et:'эстонский',
+    ca:'каталанский', fa:'персидский', hi:'хинди',
+  };
+  const REQ_LABELS = {
+    system:'ОС', os:'ОС', processor:'Процессор', cpu:'Процессор', memory:'Оперативная память', ram:'Оперативная память',
+    graphics:'Видеокарта', video:'Видеокарта', directx:'DirectX', storage:'Место на диске', disk:'Место на диске',
+    sound:'Звуковая карта', soundcard:'Звуковая карта', network:'Сеть', additional:'Примечания', notes:'Примечания',
+  };
+
+  const gArr = (x) => (Array.isArray(x) ? x : x ? [x] : []);
+  const gName = (o) => (typeof o === 'string' ? o : (o && (o.name || o.title)) || '');
+
+  function decodeEntities(s) {
+    const map = { amp:'&', lt:'<', gt:'>', quot:'"', apos:"'", nbsp:' ', laquo:'«', raquo:'»', ndash:'–', mdash:'—', hellip:'…', reg:'®', trade:'™', copy:'©' };
+    return s.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (m, e) => {
+      if (e[0] === '#') {
+        const n = e[1].toLowerCase() === 'x' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+        return Number.isFinite(n) ? String.fromCodePoint(n) : m;
+      }
+      const v = map[e.toLowerCase()];
+      return v === undefined ? m : v;
+    });
+  }
+  const stripTags = (h) => decodeEntities(String(h || '').replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
+  function htmlToText(html) {
+    if (!html || typeof html !== 'string') return '';
+    const s = html
+      .replace(/<br\s*\/?>/gi, '\n').replace(/<\/(p|div|h\d|ul|ol)>/gi, '\n')
+      .replace(/<li[^>]*>/gi, '- ').replace(/<\/li>/gi, '\n').replace(/<[^>]+>/g, '');
+    return decodeEntities(s).replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  function gogDate(...cands) {
+    for (const c of cands) {
+      const m = String(c || '').match(/(\d{4})-(\d{2})-(\d{2})/);
+      if (m) return `${Number(m[3])} ${GOG_MONTHS[Number(m[2]) - 1]} ${m[1]}`;
+    }
+    return '______';
+  }
+
+  // английские названия языков -> русские (ключ: строчные буквы, без скобок и тире)
+  const GOG_EN_NAMES = {
+    'english':'английский', 'russian':'русский', 'german':'немецкий', 'french':'французский', 'italian':'итальянский',
+    'spanish':'испанский', 'spanish spain':'испанский', 'castilian spanish':'испанский',
+    'latin american spanish':'испанский Лат. Ам.', 'spanish latin america':'испанский Лат. Ам.', 'spanish latam':'испанский Лат. Ам.', 'spanish mexico':'испанский Лат. Ам.',
+    'portuguese':'португальский', 'portuguese portugal':'португальский',
+    'brazilian portuguese':'бр. португальский', 'portuguese brazil':'бр. португальский', 'portuguese brazilian':'бр. португальский',
+    'chinese simplified':'китайский (упр.)', 'simplified chinese':'китайский (упр.)', 'chinese':'китайский',
+    'chinese traditional':'китайский (трад.)', 'traditional chinese':'китайский (трад.)',
+    'japanese':'японский', 'korean':'корейский', 'polish':'польский', 'czech':'чешский', 'hungarian':'венгерский',
+    'turkish':'турецкий', 'ukrainian':'украинский', 'arabic':'арабский', 'swedish':'шведский', 'dutch':'нидерландский',
+    'danish':'датский', 'finnish':'финский', 'norwegian':'норвежский', 'romanian':'румынский', 'bulgarian':'болгарский',
+    'greek':'греческий', 'hebrew':'иврит', 'thai':'тайский', 'vietnamese':'вьетнамский', 'indonesian':'индонезийский',
+    'slovak':'словацкий', 'slovenian':'словенский', 'serbian':'сербский', 'croatian':'хорватский', 'lithuanian':'литовский',
+    'latvian':'латышский', 'estonian':'эстонский', 'catalan':'каталанский', 'persian':'персидский', 'hindi':'хинди',
+  };
+
+  function gogLangName(code, ...names) {
+    const c = String(code || '').toLowerCase().replace(/_/g, '-');
+    if (c && GOG_LANGS[c]) return GOG_LANGS[c];
+    for (const n of names) {
+      const s = String(n || '').trim();
+      if (!s) continue;
+      const key = s.toLowerCase().replace(/[()\-–—]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (GOG_EN_NAMES[key]) return GOG_EN_NAMES[key];
+      if (/[а-яё]/i.test(s)) return normLang(s);
+    }
+    const base = c.split('-')[0];
+    if (base && GOG_LANGS[base]) return GOG_LANGS[base];
+    return lcfirst(String(names.find(Boolean) || code || ''));
+  }
+
+  const ruFirstG = (arr) => [...arr.filter((x) => x === 'русский'), ...arr.filter((x) => x !== 'русский')];
+  const uniq = (arr) => [...new Set(arr)];
+
+  // «китайский» без уточнения: если рядом упрощённый — это традиционный, и наоборот
+  function fixChinese(names) {
+    const s = names.includes('китайский (упр.)'), t = names.includes('китайский (трад.)');
+    return names.map((n) => (n === 'китайский' ? (s && !t ? 'китайский (трад.)' : t && !s ? 'китайский (упр.)' : n) : n));
+  }
+
+  // языки текста и озвучки из v2 (localizations); запасной вариант — список языков из v1
+  function parseGogLangs(emb, v1) {
+    const text = [], audio = [];
+    let hasScope = false;
+    for (const loc of gArr(emb.localizations)) {
+      const e = loc._embedded || loc;
+      const lang = e.language || loc.language || {};
+      const scopeObj = e.localizationScope || loc.localizationScope || e.scope || {};
+      const scope = typeof scopeObj === 'string' ? scopeObj : scopeObj.type || '';
+      const name = gogLangName(lang.code, lang.name, lang.nativeName, e.name, loc.name);
+      if (!name) continue;
+      if (/audio|voice/i.test(scope)) { audio.push(name); hasScope = true; }
+      else { text.push(name); if (/text/i.test(scope)) hasScope = true; }
+    }
+    if (!text.length && v1 && v1.languages && typeof v1.languages === 'object') {
+      for (const [code, nm] of Object.entries(v1.languages)) text.push(gogLangName(code, nm));
+    }
+    return { all: orderLangs(fixChinese(text)), audio: orderLangs(fixChinese(audio)), hasScope };
+  }
+
+  function gogTag(all) {
+    const parts = [];
+    if (all.includes('русский')) parts.push('RUS');
+    if (all.includes('английский')) parts.push('ENG');
+    if (all.length > parts.length) parts.push('MULTi' + all.length);
+    return parts.join('|');
+  }
+
+  function parseGogReqItems(emb) {
+    const oses = gArr(emb.supportedOperatingSystems);
+    const isWin = (o) => /windows/i.test(JSON.stringify(o.operatingSystem || (o._embedded && o._embedded.operatingSystem) || o.name || ''));
+    const os = oses.find(isWin) || oses[0];
+    if (!os) return [];
+    const sets = gArr(os.systemRequirements);
+    const min = sets.find((s) => /min/i.test(s.type || '')) || sets[0];
+    if (!min) return [];
+    return gArr(min.requirements).map((r) => {
+      const key = String(r.id || '').toLowerCase();
+      return { key, label: REQ_LABELS[key] || r.name || r.id, value: stripTags(r.description) };
+    }).filter((x) => x.value);
+  }
+  const parseGogReq = (emb) => parseGogReqItems(emb).map((i) => `[b]${i.label}[/b]: ${i.value}`).join('\n');
+
+  function buildGogShots(urls) {
+    if (!urls.length) return '[th]______[/th] [th]______[/th] [th]______[/th]';
+    const cells = urls.map((u) => `[th]${u}[/th]`);
+    const rows = [];
+    for (let i = 0; i < cells.length; i += 3) rows.push(cells.slice(i, i + 3).join(' '));
+    return rows.join('\n');
+  }
+
+  // чистая функция: из ответов API собирает данные для шаблона
+  function buildGogData(v1, v2, extra) {
+    v1 = v1 || {}; v2 = v2 || {};
+    const emb = v2._embedded || {};
+    const prod = emb.product || {};
+    const warn = [];
+
+    const title = prod.title || v2.title || v1.title || '___________';
+    const developers = gArr(emb.developers).map(gName).filter(Boolean);
+    const publishers = (emb.publisher ? [gName(emb.publisher)] : gArr(emb.publishers).map(gName)).filter(Boolean);
+    const genres = (extra.genres && extra.genres.length ? extra.genres : gArr(emb.properties).map(gName)).filter(Boolean);
+    const langs = parseGogLangs(emb, v1);
+    const req = parseGogReq(emb);
+    const reqItems = parseGogReqItems(emb);
+    const date = gogDate(prod.globalReleaseDate, prod.gogReleaseDate, v2.releaseDate, v1.release_date);
+    const description = extra.description || ''; // описание берём со Steam, не с GOG
+
+    const bonusLines = [], rtoBonusLines = [], dlcLines = [];
+    for (const dlc of gArr(v1.expanded_dlcs)) {
+      const n = gName(dlc);
+      if (!n) continue;
+      const slug = dlc && typeof dlc === 'object' ? dlc.slug : '';
+      const link = slug ? `https://www.gog.com/ru/game/${slug}`
+        : (dlc && dlc.links && dlc.links.product_card ? dlc.links.product_card.replace('gog.com/game/', 'gog.com/ru/game/') : '');
+      dlcLines.push(link ? `[url=${link}]${n}[/url]` : n);
+    }
+    const dl = v1.downloads && typeof v1.downloads === 'object' ? v1.downloads : {};
+    // бонусы: то, что указано на странице («Включает: …» у изданий), + bonus_content из API; без дублей
+    const bonusNames = [];
+    const addBonus = (n) => {
+      n = (n || '').replace(/\s+/g, ' ').trim();
+      if (n && !bonusNames.some((x) => x.toLowerCase() === n.toLowerCase())) bonusNames.push(n);
+    };
+    (extra.pageBonuses || []).forEach(addBonus);
+    for (const b of gArr(dl.bonus_content)) addBonus(gName(b));
+    bonusNames.forEach((n) => { bonusLines.push(n); rtoBonusLines.push(n); });
+
+    if (!developers.length) warn.push('разработчик');
+    if (!publishers.length) warn.push('издатель');
+    if (!genres.length) warn.push('жанр');
+    if (!langs.all.length) warn.push('языки');
+    if (!req) warn.push('системные требования');
+    if (!description) warn.push('описание (игра не найдена в Steam)');
+    if (!extra.logo) warn.push('лого (нужно только для RTO)');
+    if (!extra.poster || /_{3,}/.test(extra.poster)) warn.push('постер');
+    if (!extra.shots.length) warn.push('скриншоты');
+
+    return {
+      title,
+      tag: gogTag(langs.all),
+      date,
+      year: (date.match(/\d{4}/) || ['____'])[0],
+      genresEn: extra.genresEn || '_____',
+      logo: extra.logo || '___________',
+      langAll: langs.all,
+      langAudio: langs.audio,
+      reqItems,
+      pageUrl: extra.pageUrl || '',
+      shotUrls: extra.shots,
+      genres: genres.join(', ') || '______',
+      developers: developers.join(', ') || '______',
+      publishers: publishers.join(', ') || '______',
+      ui: joinLangs(langs.all) || '______',
+      voice: langs.audio.length ? joinLangs(langs.audio) : (langs.hasScope ? 'Отсутствует' : '______'),
+      req: req || '_________',
+      description: description || '____________',
+      bonus: bonusLines.join('\n'),
+      bonusRto: rtoBonusLines.join('\n'),
+      dlc: dlcLines.join('\n'),
+      dlcCount: dlcLines.length,
+      gogId: extra.gogId || '',
+      gogVersion: extra.version || '',
+      gogVersionDate: extra.versionDate || '',
+      poster: extra.poster || '___________',
+      shots: buildGogShots(extra.shots.slice(0, 6)), // Tapochek: максимум 6
+      warn,
+    };
+  }
+
+  // данные GOG -> формат шаблона RTO (тот же, что «GOG» со Steam)
+  function gogToRto(d) {
+    const req = { os: '—', cpu: '—', ram: '—', gpu: '—', dx: '—', disk: '—' };
+    const field = { system:'os', os:'os', processor:'cpu', cpu:'cpu', memory:'ram', ram:'ram', graphics:'gpu', video:'gpu', directx:'dx', storage:'disk', disk:'disk' };
+    for (const it of d.reqItems) {
+      const f = field[it.key];
+      if (f) req[f] = f === 'dx' ? lcfirst(it.value) : it.value;
+    }
+    return {
+      appid: '', gogUrl: d.pageUrl, name: d.title, ea: false, logo: d.logo, poster: d.poster, date: d.date,
+      genres: d.genres, developers: d.developers, publishers: d.publishers, ui: d.ui, voice: d.voice,
+      langTag: (langTag(d.langAll) || 'NO') + (d.langAudio.length ? ` / ${langTag(d.langAudio, true)}` : ''),
+      year: d.year, genreEn: d.genresEn, req, description: d.description,
+      shots: buildShots(d.shotUrls),
+      bonus: d.bonusRto,
+      dlc: d.dlc, dlcCount: d.dlcCount,
+      gogId: d.gogId, version: d.gogVersion, versionDate: d.gogVersionDate,
+      search: encodeURIComponent(d.title.replace(/[™®©]/g, '').replace(/\s+/g, ' ').trim()),
+    };
+  }
+
+  function buildGogSiteTemplate(d) {
+    const bonus = d.bonus ? `[spoiler="Бонусы"]\n${d.bonus}\n[/spoiler]\n\n` : '';
+    const dlcs = d.dlc ? `[spoiler="DLC"]\n${d.dlc}\n[/spoiler]\n\n` : '';
+    return `${d.title} (${d.publishers}) (${d.tag}) [DL|GOG]
+
+[align=center][size=24]${d.title}[/size][/align]
+[hr]
+[poster]${d.poster}[/poster]
+
+[size=14]
+[b]Дата выхода[/b]: ${d.date}
+[b]Жанр[/b]: ${d.genres}
+[b]Разработчик[/b]: ${d.developers}
+[b]Издательство[/b]: ${d.publishers}
+[b]Тип издания[/b]: Лицензия
+[b]Версия[/b]: ${d.gogVersion || '___________'} от ${d.gogVersionDate || '___________'}
+[b]Язык интерфейса[/b]: ${d.ui}
+[b]Язык озвучки[/b]: ${d.voice}
+[b]Таблетка[/b]: Не требуется
+[hr]
+[b]Системные требования[/b]:
+${d.req}
+[/size]
+[hr]
+[size=14][b]Описание[/b]:[/size]
+[size=14]
+${d.description}
+[/size]
+[hr]
+${dlcs}${bonus}[spoiler="Скриншоты"][align=center]
+${d.shots}
+[/align][/spoiler]
+
+[spoiler="Установка и запуск"]
+1. Запустить [color=green][b].exe[/b][/color]
+2. Следовать инструкции установщика
+3. Играть
+[/spoiler]`;
+  }
+
+  // ---- сетевая часть ----
+  // жанры — только из строки «Жанр:» на странице (теги не берём)
+  function gogGenresFromDom() {
+    const labels = [...document.querySelectorAll('div,span,dt,th,td,li,p,b,strong')];
+    const label = labels.find((el) => el.children.length === 0 && /^(жанр|жанры|genre|genres)\s*:?$/i.test(el.textContent.trim()));
+    if (!label) return [];
+    const box = label.nextElementSibling || label.parentElement;
+    if (!box) return [];
+    const links = [...box.querySelectorAll('a')].map((a) => a.textContent.trim()).filter(Boolean);
+    if (links.length) return links;
+    return box.textContent.replace(label.textContent, '').split(/\s+[-–—]\s+|,|\/|·/).map((s) => s.trim()).filter(Boolean);
+  }
+
+  // описание берём со Steam: ищем игру по названию и читаем краткое описание на русском
+  async function steamDescription(titles) {
+    const norm = (s) => String(s || '').toLowerCase().replace(/[™®©]/g, '').replace(/[^\p{L}\p{N}]+/gu, '');
+    for (const title of titles.filter(Boolean)) {
+      const want = norm(title);
+      if (!want) continue;
+      try {
+        const q = String(title).replace(/[™®©]/g, '').trim();
+        const j = await getJSON(`https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(q)}&l=russian&cc=us`);
+        const hit = (j.items || []).find((i) => norm(i.name) === want);
+        if (!hit) continue;
+        const info = await getJSON(`https://store.steampowered.com/api/appdetails?appids=${hit.id}&l=russian&cc=ru`);
+        const e = info[hit.id];
+        const text = e && e.success ? textOf(e.data.short_description) : '';
+        if (text) { console.log('[steam-template][gog] описание взято из Steam, appid', hit.id); return text; }
+      } catch (err) { console.warn('[steam-template][gog] поиск описания в Steam не удался:', err); }
+    }
+    return '';
+  }
+
+  async function findGogUrl(name) {
+    const norm = (s) => String(s || '').toLowerCase().replace(/[™®©]/g, '').replace(/[^\p{L}\p{N}]+/gu, '');
+    const want = norm(name);
+    const q = String(name || '').replace(/[™®©]/g, '').trim();
+    if (!want) return '';
+    const pick = (list) => {
+      const hit = (list || []).find((p) => p && p.slug && norm(p.title) === want);
+      return hit ? `https://www.gog.com/ru/game/${hit.slug}` : '';
+    };
+    try {
+      const j = await getJSON(`https://embed.gog.com/games/ajax/filtered?mediaType=game&search=${encodeURIComponent(q)}`);
+      const u = pick(j.products);
+      if (u) return u;
+    } catch (e) { console.warn('[steam-template][gog] embed-поиск не сработал:', e); }
+    try {
+      const j = await getJSON(`https://catalog.gog.com/v1/catalog?limit=20&query=like:${encodeURIComponent(q)}&order=desc:score&productType=in:game,pack&page=1&locale=en-US&countryCode=RU`);
+      const u = pick(j.products);
+      if (u) return u;
+    } catch (e) { console.warn('[steam-template][gog] catalog-поиск не сработал:', e); }
+    return '';
+  }
+
+  // логотип с прозрачным фоном: product_card_v2_logo_480x285.png
+  const gogLogoFromHash = (u) => {
+    const m = String(u || '').match(/([0-9a-f]{32,64})/i);
+    return m ? `https://images.gog-statics.com/${m[1].toLowerCase()}_product_card_v2_logo_480x285.png` : '';
+  };
+  function gogLogosFromDom() {
+    const html = document.documentElement.innerHTML.replace(/\\\//g, '/');
+    const re = /(?:https?:)?\/\/[^"'\s()]*gog-statics\.com\/[0-9a-f]{32,64}_product_card_v2_logo_\d+x\d+\.png/gi;
+    return (html.match(re) || []).map((u) => (u.startsWith('//') ? 'https:' + u : u));
+  }
+
+  async function gogProductId() {
+    const el = document.querySelector('[card-product]');
+    if (el && /^\d+$/.test(el.getAttribute('card-product') || '')) return el.getAttribute('card-product');
+    const html = document.documentElement.innerHTML;
+    const m = html.match(/card-product="(\d+)"/) || html.match(/"cardProductId"\s*:\s*"?(\d+)/) || html.match(/data-product-id="(\d+)"/);
+    if (m) return m[1];
+    const slug = (location.pathname.match(/\/game\/([^/?#]+)/) || [])[1];
+    if (slug) {
+      try {
+        const j = await getJSON(`https://embed.gog.com/games/ajax/filtered?mediaType=game&search=${encodeURIComponent(slug.replace(/_/g, ' '))}`);
+        const hit = (j.products || []).find((p) => p.slug === slug);
+        if (hit) return String(hit.id);
+      } catch (e) { console.warn('[steam-template][gog] поиск ID не удался:', e); }
+    }
+    return '';
+  }
+
+  async function gogShotUrls(v1) {
+    const shots = (v1 && v1.screenshots) || [];
+    if (!shots.length) return [];
+    const plain = (s) => `https://images.gog-statics.com/${s.image_id}.jpg`;
+    const best = (s) => {
+      const f = gArr(s.formatted_images);
+      const pick = f.find((x) => x.formatter_name === 'ggvgl_2x') || f[f.length - 1];
+      return pick ? pick.image_url : String(s.formatter_template_url || '').replace('{formatter}', 'ggvgl_2x');
+    };
+    const usePlain = shots[0].image_id && (await imageLoads(plain(shots[0])));
+    return shots.map(usePlain ? plain : best).filter(Boolean);
+  }
+
+  // последняя версия и её дата со страницы GOGDB (таблица «GOG Galaxy Builds»)
+  async function gogdbVersion(id) {
+    try {
+      const html = await getText(`https://www.gogdb.org/product/${id}`);
+      return parseGogdbVersion(new DOMParser().parseFromString(html, 'text/html'));
+    } catch (e) { console.warn('[steam-template][gog] версия с GOGDB не получена:', e); }
+    return null;
+  }
+
+  // бонусы со страницы GOG: блок изданий «Special Edition — Включает: Soundtrack (Mp3), Soundtrack (Wav)»
+  function gogBonusesFromDom() {
+    const out = [];
+    try {
+      const text = document.body.innerText || '';
+      const re = /(?:Включает|Includes|Enthält|Zawiera|Inclut|Comprend|Incluye|包含)\s*:\s*([^\n\r]+)/g;
+      let mt;
+      while ((mt = re.exec(text))) {
+        let line = mt[1].replace(/\s*[-−–]?\s*\d+\s*%.*$/, '').replace(/\{\{.*$/, '').trim();
+        if (!line || line.length > 200) continue;
+        for (const part of line.split(/\s*,\s*(?![^()]*\))/)) {
+          const n = part.trim();
+          if (n && n.length <= 80 && !out.some((x) => x.toLowerCase() === n.toLowerCase())) out.push(n);
+        }
+      }
+    } catch (e) { console.warn('[steam-template][gog] бонусы со страницы не получены:', e); }
+    return out;
+  }
+
+  async function fetchGog() {
+    const id = await gogProductId();
+    if (!id) throw new Error('не удалось определить ID игры на странице');
+    const RU = { 'Accept-Language': 'ru-RU,ru;q=0.9' };
+    const EN = { 'Accept-Language': 'en-US,en;q=0.9' };
+    const soft = (p, what) => p.catch((e) => { console.warn(`[steam-template][gog] ${what} не сработал:`, e); return null; });
+    const [v1, v2, v2en] = await Promise.all([
+      soft(getJSON(`https://api.gog.com/products/${id}?expand=description,screenshots,downloads,expanded_dlcs&locale=ru-RU`, RU), 'products API'),
+      soft(getJSON(`https://api.gog.com/v2/games/${id}?locale=ru-RU`, RU), 'v2 API (ru)'),
+      soft(getJSON(`https://api.gog.com/v2/games/${id}?locale=en-US`, EN), 'v2 API (en)'),
+    ]);
+    if (!v1 && !v2) throw new Error('API GOG не ответил');
+    console.log('[steam-template][gog] id:', id, '\nv1:', v1, '\nv2:', v2, '\nv2 en:', v2en);
+
+    const titles = uniq([
+      v2 && v2._embedded && v2._embedded.product && v2._embedded.product.title, v2 && v2.title, v1 && v1.title,
+      v2en && v2en._embedded && v2en._embedded.product && v2en._embedded.product.title, v2en && v2en.title,
+    ].filter(Boolean));
+    const descP = steamDescription(titles);
+    const verP = gogdbVersion(id);
+
+    const fixUrl = (u) => (u && u.startsWith('//') ? 'https:' + u : u);
+    const og = document.querySelector('meta[property="og:image"]');
+    const box = v2 && v2._links && v2._links.boxArtImage && v2._links.boxArtImage.href;
+    const imgs = (v1 && v1.images) || {};
+    const logoLink = v2 && v2._links && v2._links.logo && v2._links.logo.href;
+    const domLogos = gogLogosFromDom();
+    console.log('[steam-template][gog] логотипы на странице:', domLogos);
+    const logoCandidates = [
+      domLogos[0],
+      gogLogoFromHash(logoLink), gogLogoFromHash(imgs.logo2x), gogLogoFromHash(imgs.logo),
+      fixUrl(imgs.logo2x), fixUrl(imgs.logo), logoLink,
+    ];
+    const [poster, logo, shots] = await Promise.all([
+      firstWorking([box && box.replace(/_?\{formatter\}/, ''), og && og.content]),
+      firstWorking(logoCandidates),
+      gogShotUrls(v1),
+    ]);
+    const pageUrl = location.origin + location.pathname.replace(/\/+$/, '').replace(/^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?game\//i, '/ru/game/');
+    // жанры: из строки «Жанр:» на странице; английские — по тем же записям в API (по id/slug)
+    const ruProps = gArr(((v2 || {})._embedded || {}).properties);
+    const enProps = gArr(((v2en || {})._embedded || {}).properties);
+    const domGenres = gogGenresFromDom();
+    console.log('[steam-template][gog] жанры на странице:', domGenres);
+    const normG = (s) => String(s || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+    let genresEn = [];
+    if (domGenres.length) {
+      for (const gname of domGenres) {
+        const i = ruProps.findIndex((p) => normG(gName(p)) === normG(gname));
+        if (i < 0) continue;
+        const p = ruProps[i];
+        const en = enProps.find((x) => (p.id !== undefined && x.id === p.id) || (p.slug && x.slug === p.slug))
+          || (enProps.length === ruProps.length ? enProps[i] : null);
+        if (en) genresEn.push(gName(en));
+      }
+    } else {
+      genresEn = enProps.map(gName);
+    }
+    const description = await descP;
+    const ver = await verP;
+    const data = buildGogData(v1, v2, {
+      poster: poster.ok ? poster.url : '', logo: logo.ok ? logo.url : '',
+      genres: domGenres, genresEn: genresEn.join(', '), description, shots, pageUrl,
+      pageBonuses: gogBonusesFromDom(),
+      gogId: id, version: ver ? ver.version : '', versionDate: ver && ver.date ? gogDate(ver.date) : '',
+    });
+    if (!ver) data.warn.push('версия на GOGDB');
+    else if (!ver.date) data.warn.push('дата версии на GOGDB');
+    return data;
+  }
+
+  // ---------- UI ----------
+  const IS_GOG = /(^|\.)gog\.com$/.test(location.hostname);
+  const steamAppId = () => (location.pathname.match(/\/app\/(\d+)/) || [])[1];
+  const isGamePage = () => (IS_GOG ? /\/game\//.test(location.pathname) : !!steamAppId());
+  if (!IS_GOG && !isGamePage()) return;
+
+  // шаблоны: на gog.com — RTO (шаблон «GOG» со Steam) и Tapochek; на Steam/SteamDB — Portable, Scene и GOG
+  const TEMPLATES = IS_GOG ? [['rto', 'RTO'], ['tapochek', 'Tapochek']] : [['portable', 'Portable'], ['scene', 'Scene'], ['gog', 'GOG']];
+
+  const mk = (tag, css, text) => {
+    const e = document.createElement(tag);
+    if (css) e.style.cssText = css;
+    if (text) e.textContent = text;
+    return e;
+  };
+  const BTN = 'padding:6px 10px;cursor:pointer;';
+
+  const btn = mk('button', 'position:fixed;right:16px;bottom:16px;z-index:2147483647;padding:10px 14px;' +
+    'background:#4b0082;color:#fff;border:0;border-radius:6px;cursor:pointer;font:14px Arial;', '📋 Шаблон');
+  const panel = mk('div', 'position:fixed;right:16px;bottom:64px;z-index:2147483647;width:480px;padding:10px;' +
+    'background:#1b2838;color:#fff;border:1px solid #4b0082;border-radius:6px;display:none;font:13px Arial;');
+  const statusEl = mk('div', 'margin-bottom:6px;min-height:16px');
+  const tplRow = mk('div', 'display:flex;gap:6px;margin-bottom:6px;align-items:center');
+  tplRow.appendChild(mk('span', '', 'Шаблон:'));
+  const tplButtons = TEMPLATES.map(([key, label]) => {
+    const b = mk('button', BTN + 'padding:5px 12px;', label);
+    b.dataset.tpl = key;
+    tplRow.appendChild(b);
+    return b;
+  });
+  const out = mk('textarea', 'width:100%;height:340px;box-sizing:border-box;font:12px Consolas,monospace;');
+  out.spellcheck = false;
+  const bottom = mk('div', 'margin-top:8px;display:flex;gap:6px');
+  const copyBtn = mk('button', BTN, 'Копировать');
+  const refreshBtn = mk('button', BTN, 'Обновить');
+  const closeBtn = mk('button', BTN + 'margin-left:auto;', 'Закрыть');
+  bottom.append(copyBtn, refreshBtn, closeBtn);
+  panel.append(statusEl, tplRow, out, bottom);
+  document.body.append(btn, panel);
+
+  const setStatus = (t) => (statusEl.textContent = t);
+  let lastData = null, lastUrl = '', tpl = null;
+
+  function markActive() {
+    tplButtons.forEach((b) => {
+      const on = b.dataset.tpl === tpl;
+      b.style.background = on ? '#4b0082' : '';
+      b.style.color = on ? '#fff' : '';
+    });
+  }
+
+  async function render(kind, refetch) {
+    tpl = kind;
+    markActive();
+    setStatus('Загрузка…');
+    try {
+      if (!lastData || refetch || lastUrl !== location.href) {
+        lastData = IS_GOG ? await fetchGog() : await fetchApp(steamAppId());
+        lastUrl = location.href;
+      }
+      if (!IS_GOG && kind === 'gog' && lastData.gogUrl === undefined) {
+        setStatus('Ищу страницу игры на GOG…');
+        lastData.gogUrl = await findGogUrl(lastData.name);
+      }
+      if (IS_GOG) {
+        out.value = kind === 'rto' ? buildTemplate(gogToRto(lastData), 'gog') : buildGogSiteTemplate(lastData);
+        setStatus(lastData.warn.length ? 'Готово, но не найдено: ' + lastData.warn.join(', ') + ' (см. консоль F12)' : 'Готово ✔');
+      } else {
+        out.value = kind === 'scene' ? buildSceneTemplate(lastData) : buildTemplate(lastData, kind);
+        let msg = lastData.assetsOk ? 'Готово ✔' : 'Готово, но не удалось найти рабочую ссылку: ' + lastData.assetsMsg + ' (см. консоль F12)';
+        if (kind === 'gog' && !lastData.gogUrl) msg += ' · страница игры на GOG не найдена, ссылка Digital осталась пустой';
+        setStatus(msg);
+      }
+    } catch (e) {
+      setStatus('Ошибка: ' + e.message);
+    }
+  }
+
+  btn.addEventListener('click', () => {
+    const open = panel.style.display === 'none';
+    panel.style.display = open ? 'block' : 'none';
+    if (open && !tpl) setStatus('Выберите шаблон');
+  });
+  tplButtons.forEach((b) => b.addEventListener('click', () => render(b.dataset.tpl, false)));
+  refreshBtn.addEventListener('click', () => (tpl ? render(tpl, true) : setStatus('Сначала выберите шаблон')));
+  closeBtn.addEventListener('click', () => (panel.style.display = 'none'));
+  copyBtn.addEventListener('click', () => {
+    GM_setClipboard(out.value);
+    setStatus('Скопировано в буфер обмена');
+  });
+
+  // gog.com — одностраничный сайт: кнопка видна только на страницах игр
+  if (IS_GOG) {
+    const sync = () => {
+      const show = isGamePage();
+      btn.style.display = show ? '' : 'none';
+      if (!show) panel.style.display = 'none';
+    };
+    sync();
+    setInterval(sync, 800);
+  }
+  }
+
+  // ─────────── GOGDB: строка «версия от даты» для раздачи ───────────
+
+  // разбор страницы GOGDB: последняя версия и дата (Builds + Changelog)
+  function parseGogdbVersion(doc) {
+  const cells = (tr) => [...tr.children].map((c) => c.textContent.replace(/\s+/g, ' ').trim());
+  const heads = (t) => { const tr = t.querySelector('tr'); return tr ? cells(tr).map((x) => x.toLowerCase()) : []; };
+  const findTable = (need) => [...doc.querySelectorAll('table')].find((t) => { const h = heads(t); return need.every((n) => h.includes(n)); });
+  const body = (t) => [...t.querySelectorAll('tr')].slice(1).map(cells);
+
+  // дата берётся из «Changelog»: когда установщик (Installer) стал этой версией
+  // (Download changed ... ⇒ версия); если такой записи нет — Download added;
+  // если нет и её — дата сборки из таблицы Builds
+  const withChangelog = (res) => {
+    try {
+      const esc = res.version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const ver = '(?![\\d.]*\\d)';
+      const reNew = new RegExp('⇒\\s*' + esc + ver);
+      const reAdded = new RegExp('Version\\s+' + esc + ver);
+      const ct = [...doc.querySelectorAll('table')].find((t) =>
+        /Download (added|changed)/.test(t.textContent) &&
+        body(t).some((r) => /^\d{4}-\d{2}-\d{2}/.test(r[r.length - 1] || '')));
+      if (!ct) return res;
+      const log = body(ct)
+        .map((r) => ({ text: r.slice(0, -1).join(' '), date: (r[r.length - 1] || '').slice(0, 10) }))
+        .filter((r) => /^\d{4}-\d{2}-\d{2}$/.test(r.date) && /Installer/.test(r.text));
+      const pick = (rows, latest) => {
+        if (!rows.length) return '';
+        const win = rows.filter((r) => /,\s*Windows\s*,/.test(r.text));
+        const pool = win.length ? win : rows;
+        return pool.map((r) => r.date).sort()[latest ? pool.length - 1 : 0];
+      };
+      const changed = log.filter((r) => /Download changed/.test(r.text) && reNew.test(r.text) &&
+        (r.text.match(/Version\s+([\d.]+)\s*⇒/) || [])[1] !== res.version);
+      const added = log.filter((r) => /Download added/.test(r.text) && reAdded.test(r.text));
+      const d = pick(changed, true) || pick(added, false);
+      if (d) return { version: res.version, date: d };
+    } catch (e) { console.warn('[steam-template][gog] дата из changelog не получена:', e); }
+    return res;
+  };
+
+  const bt = findTable(['build id', 'os', 'version', 'date']);
+  if (bt) {
+    const h = heads(bt);
+    const iOs = h.indexOf('os'), iV = h.indexOf('version'), iD = h.indexOf('date');
+    const rows = body(bt).filter((r) => r[iV] && /^\d{4}-\d{2}-\d{2}/.test(r[iD] || ''));
+    if (rows.length) {
+      const win = rows.filter((r) => /^w/i.test(r[iOs]));
+      const pool = win.length ? win : rows;
+      const best = pool.reduce((a, r) => (r[iD] > a[iD] ? r : a), pool[0]);
+      return withChangelog({ version: best[iV], date: best[iD].slice(0, 10) });
+    }
+  }
+  // запасной вариант: версия офлайн-установщика (даты там нет)
+  const it = findTable(['os', 'language', 'version']);
+  if (it) {
+    const h = heads(it);
+    const iOs = h.indexOf('os'), iV = h.indexOf('version');
+    const rows = body(it).filter((r) => r[iV]);
+    const row = rows.find((r) => /^w/i.test(r[iOs])) || rows[0];
+    if (row) return withChangelog({ version: row[iV], date: '' });
+  }
+    return null;
+  }
+
+  function initGogdbVersionLine() {
+    const idm = location.pathname.match(/^\/product\/(\d+)/);
+    if (!idm) return;
+    const id = idm[1];
+    const MONTHS = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+
+    function render(res) {
+      const dm = (res.date || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+      const dateRu = dm ? `${Number(dm[3])} ${MONTHS[Number(dm[2]) - 1]} ${dm[1]}` : '___________';
+      const line = `[url=https://www.gogdb.org/product/${id}]${res.version}[/url] от ${dateRu}`;
+
+      const box = document.createElement('div');
+      Object.assign(box.style, { margin: '8px 0', padding: '8px 12px', border: '1px solid #5a2d82', borderRadius: '4px', font: '13px/1.5 monospace', wordBreak: 'break-all' });
+      const text = document.createElement('span');
+      text.textContent = line;
+      const btn = document.createElement('a');
+      btn.href = '#';
+      btn.textContent = 'Копировать';
+      styleButton(btn, COLOR_GOGDB, { margin: '0 0 0 12px', padding: '3px 8px', font: '600 12px/1.4 sans-serif' });
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        try { GM_setClipboard(line); } catch (err) { navigator.clipboard && navigator.clipboard.writeText(line); }
+        btn.textContent = 'Скопировано ✓';
+        setTimeout(() => { btn.textContent = 'Копировать'; }, 1500);
+      });
+      box.append(text, btn);
+      const h1 = document.querySelector('h1');
+      if (h1) h1.insertAdjacentElement('afterend', box);
+      else document.body.prepend(box);
+    }
+
+    let tries = 0;
+    const timer = setInterval(() => {
+      tries++;
+      let res = null;
+      try { res = parseGogdbVersion(document); } catch (e) { /* ждём */ }
+      if (res && res.version) { clearInterval(timer); render(res); }
+      else if (tries > 40) clearInterval(timer);
+    }, 250);
+  }
+
+  // ───────────────────────── Запуск по сайтам ─────────────────────────
+
+  if (onGogdb) {
+    initRussianDates();
+    initGogdbOpenGame();
+    initGogdbVersionLine();
+  } else if (onGog) {
+    initGog();
+    initSteamTemplate();
+  } else if (onSteam) {
+    initSteamTemplate();
+  } else if (onRutracker || onTapochek || onAppnetica) {
+    initTopicPages();
+  }
+})();
