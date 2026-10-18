@@ -1,0 +1,51 @@
+// ==UserScript==
+// @name         Rutracker: заготовки текстов
+// @namespace    local.rutracker.templates
+// @version      1.0
+// @description  Выпадающее меню с готовыми текстами возле поля ответа
+// @match        https://rutracker.org/forum/viewtopic.php*
+// @match        https://rutracker.org/forum/posting.php*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ← Редактируйте свои заготовки здесь
+  const TEMPLATES = {
+    'Спасибо':        'Спасибо за раздачу!',
+    'Подскажите':     'Подскажите, пожалуйста, как это запустить?',
+    'Seed, please':   'Пожалуйста, вернитесь на раздачу, очень нужна помощь!',
+    'Цитата-пример':  '[quote="Ник"]Текст цитаты[/quote]\n',
+  };
+
+  const ta = document.querySelector('#post-textarea');
+  if (!ta) return;
+
+  const select = document.createElement('select');
+  select.style.cssText = 'margin:0 0 4px 0; padding:2px; max-width:100%;';
+
+  const placeholder = new Option('— Заготовки —', '');
+  select.appendChild(placeholder);
+  for (const [label, text] of Object.entries(TEMPLATES)) {
+    select.appendChild(new Option(label, text));
+  }
+
+  select.addEventListener('change', () => {
+    const text = select.value;
+    if (!text) return;
+
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    ta.value = ta.value.slice(0, start) + text + ta.value.slice(end);
+
+    const pos = start + text.length;
+    ta.setSelectionRange(pos, pos);
+    ta.focus();
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+
+    select.selectedIndex = 0; // сброс меню
+  });
+
+  ta.parentNode.insertBefore(select, ta);
+})();
