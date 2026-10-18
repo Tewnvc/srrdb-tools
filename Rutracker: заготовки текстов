@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rutracker: заготовки текстов
 // @namespace    local.rutracker.templates
-// @version      1.0
+// @version      1.1
 // @description  Выпадающее меню с готовыми текстами возле поля ответа
 // @match        https://rutracker.org/forum/viewtopic.php*
 // @match        https://rutracker.org/forum/posting.php*
@@ -13,20 +13,19 @@
 
   // ← Редактируйте свои заготовки здесь
   const TEMPLATES = {
-    'Спасибо':        'Спасибо за раздачу!',
-    'Подскажите':     'Подскажите, пожалуйста, как это запустить?',
-    'Seed, please':   'Пожалуйста, вернитесь на раздачу, очень нужна помощь!',
-    'Цитата-пример':  '[quote="Ник"]Текст цитаты[/quote]\n',
+    '∑ поглощено':                    '[b][color=#996600]∑[/color] поглощено[/b]',
+    'Обновлено до v':                 'Обновлено до v',
+    'Спасибо R.G.GOGFAN и alter_go':  'Спасибо [b]R.G.GOGFAN[/b] и [b]alter_go[/b]',
+    'Спасибо deuce0':                 'Спасибо [b]deuce0[/b]',
   };
 
   const ta = document.querySelector('#post-textarea');
   if (!ta) return;
 
   const select = document.createElement('select');
-  select.style.cssText = 'margin:0 0 4px 0; padding:2px; max-width:100%;';
+  select.style.cssText = 'display:block; margin:0 auto 4px auto; padding:2px; max-width:100%;';
 
-  const placeholder = new Option('— Заготовки —', '');
-  select.appendChild(placeholder);
+  select.appendChild(new Option('— Заготовки —', ''));
   for (const [label, text] of Object.entries(TEMPLATES)) {
     select.appendChild(new Option(label, text));
   }
