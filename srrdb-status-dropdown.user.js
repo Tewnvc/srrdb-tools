@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SRRDB — выпадающий список «Готово / Пропуск»
 // @namespace    https://srrdb.com/
-// @version      1.0
+// @version      1.1
 // @description  Добавляет справа от каждого релиза в списке выпадающий список (Готово / Пропуск). Выбор запоминается.
 // @match        https://www.srrdb.com/*
 // @match        https://srrdb.com/*
@@ -36,6 +36,7 @@
             height: 22px !important; font-size: 14px !important; margin: 0 !important; display: inline-block !important;
         }
         .sd-select:focus { outline: 1px solid #2b7de9; }
+        tr.sd-update > td { box-shadow: inset 0 0 0 9999px rgba(255,215,0,.22); }
         tr.sd-done > td { box-shadow: inset 0 0 0 9999px rgba(46,160,67,.18); }
         tr.sd-skip { opacity: .4; }
         td.sd-cell, th.sd-cell {
@@ -84,6 +85,9 @@
             const name = releaseName(tr);
             if (!name) return;
             tr.dataset.sd = '1';
+
+            // Жёлтая подсветка, если в названии есть "Update"
+            if (/update/i.test(name)) tr.classList.add('sd-update');
 
             const select = document.createElement('select');
             select.className = 'sd-select';
